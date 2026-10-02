@@ -1,0 +1,29 @@
+# @package _global_
+defaults:
+  - override /data: openarm_pillow
+  - override /model: fastwam
+  - _self_
+
+batch_size: 4
+num_workers: 4
+gradient_accumulation_steps: 2
+max_steps: 100000
+learning_rate: 1.0e-4
+weight_decay: 1.0e-2
+lr_scheduler_type: cosine
+log_every: 10
+save_every: 10000
+eval_every: 1000
+eval_num_inference_steps: 10
+mixed_precision: bf16
+seed: 42
+model:
+  redirect_common_files: false
+  mot_checkpoint_mixed_attn: false
+  compile_training_denoise: false
+  action_dit_pretrained_path: ${oc.env:DIFFSYNTH_MODEL_BASE_PATH,checkpoints}/openarm_action_dit.pt
+wandb:
+  enabled: true
+  mode: offline
+  project: fastwam-openarm
+  name: pillow_0702_100k

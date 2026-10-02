@@ -1,5 +1,6 @@
 
 # Misc
+artifacts/
 outputs/
 checkpoints
 data/*
@@ -33,6 +34,7 @@ tests/
 *.bin
 *.pickle
 *.txt
+!requirements-openarm.lock.txt
 
 # Other uncheckable file types
 *.zip

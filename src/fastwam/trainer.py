@@ -732,7 +732,7 @@ class Wan22Trainer:
                         description += "lr=%.2e speed=%.2f step/s, %.2f samples/s eta=%s" % (
                             current_lr,
                             steps_per_sec,
-                            steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            steps_per_sec * self.batch_size * self.accelerator.num_processes * self.gradient_accumulation_steps,
                             eta_str,
                         )
                         logger.info(description)
@@ -742,7 +742,7 @@ class Wan22Trainer:
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,
-                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes,
+                            "performance/samples_per_sec": steps_per_sec * self.batch_size * self.accelerator.num_processes * self.gradient_accumulation_steps,
                         }
                         for key, value in global_loss_metrics.items():
                             wandb_payload[f"train/{key}"] = value
@@ -793,7 +793,8 @@ class Wan22Trainer:
                             )
 
                     if self.global_step >= self.max_steps:
-                        ckpt_info = self.save_checkpoint()
+                        if not (self.save_every > 0 and self.global_step % self.save_every == 0):
+                            ckpt_info = self.save_checkpoint()
                         if self.accelerator.is_main_process:
                             logger.info(
                                 "[done] max_steps reached step=%d weights=%s state=%s",

@@ -1,5 +1,10 @@
 # FastWAM
 
+This fork's `openarm-pillow-runtime` branch preserves OpenArm Pillow training
+changes and adds the shared OpenArm socket/SHM and Dora policy backend.
+See [OPENARM.md](OPENARM.md) for setup, deployment assets, tests and provenance.
+Weights, datasets, credentials and local observation artifacts are not included.
+
 Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future Imagination?**
 
 [![English](https://img.shields.io/badge/README-English-111111.svg)](./README.md)
