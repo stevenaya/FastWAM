@@ -15,7 +15,7 @@ import torch
 
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
-from fastwam.openarm import decode_actions, encode_state, pack_cameras
+from fastwam.openarm import decode_actions, encode_actions, encode_state, pack_cameras
 
 
 class OpenArmPolicy:
@@ -43,11 +43,30 @@ class OpenArmPolicy:
         self.contexts = {}
 
     @torch.inference_mode()
-    def predict(self, observation):
+    def predict(self, observation, *, action_prior=None, action_update_weights=None):
+        """Predict absolute actions, optionally inpainting an absolute [H,16] RTC prior.
+
+        Weights [H] mean 0=frozen and 1=free; omitted weights freeze the full prior.
+        Only the original FastWAM sampler supports this contract.
+        """
         started = time.perf_counter()
         state = np.asarray(observation["state"], dtype=np.float32)
         if state.shape != (16,) or not np.isfinite(state).all():
             raise ValueError("state must be 16 finite values in dataset order")
+        rtc_kwargs = {}
+        if action_prior is None and action_update_weights is not None:
+            raise ValueError("action_update_weights requires action_prior")
+        if action_prior is not None:
+            from fastwam.models.wan22.fastwam import FastWAM
+
+            if type(self.model).infer_action is not FastWAM.infer_action:
+                raise ValueError("Action-prior RTC supports the original FastWAM sampler, not overridden Joint/IDM samplers")
+            prior = torch.as_tensor(action_prior, dtype=torch.float32)
+            horizon = self.cfg.data.train.num_frames - 1
+            if prior.shape != (horizon, 16) or not torch.isfinite(prior).all():
+                raise ValueError(f"action_prior must be finite [{horizon},16] absolute actions")
+            rtc_kwargs = {"action_prior": encode_actions(prior, state, self.processor),
+                          "action_update_weights": action_update_weights}
         prompt = DEFAULT_PROMPT.format(task=str(np.asarray(observation["prompt"]).item()))
         if prompt not in self.contexts:
             hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -70,6 +89,7 @@ class OpenArmPolicy:
             action_horizon=self.cfg.data.train.num_frames - 1,
             num_inference_steps=self.steps, text_cfg_scale=1.0,
             seed=self.seed, compile_action_infer=self.compile_action_infer,
+            **rtc_kwargs,
         )
         actions = decode_actions(result["action"], state, self.processor).numpy()
         if not np.isfinite(actions).all():
@@ -112,7 +132,8 @@ def main():
                 if not 0 < length <= 32 * 1024 * 1024:
                     raise ValueError("Expected an NPZ body of at most 32 MiB")
                 with np.load(io.BytesIO(self.rfile.read(length)), allow_pickle=False) as obs:
-                    result = policy.predict(obs)
+                    result = policy.predict(obs, action_prior=obs.get("action_prior"),
+                                            action_update_weights=obs.get("action_update_weights"))
             except (ValueError, KeyError, FileNotFoundError) as exc:
                 return self.reply(400, {"error": str(exc)})
             self.reply(200, result)

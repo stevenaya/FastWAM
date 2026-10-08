@@ -992,7 +992,12 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         compile_action_infer: bool = False,
+        action_prior: Optional[torch.Tensor] = None,
+        action_update_weights: Optional[torch.Tensor] = None,
     ) -> dict[str, Any]:
+        """Sample actions; optional normalized RTC prior uses 0=frozen, 1=free weights."""
+        if action_prior is None and action_update_weights is not None:
+            raise ValueError("action_update_weights requires action_prior")
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
@@ -1030,6 +1035,12 @@ class FastWAM(torch.nn.Module):
             device=rand_device,
             dtype=torch.float32,
         ).to(device=self.device, dtype=self.torch_dtype)
+
+        rtc = None
+        if action_prior is not None:
+            from .rtc import ActionPriorInpainting
+
+            rtc = ActionPriorInpainting(action_prior, action_update_weights, latents_action)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
@@ -1136,7 +1147,14 @@ class FastWAM(torch.nn.Module):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+        if rtc is not None:
+            # The initial sample is already the sigma=1 prior anchor. Each
+            # projection below supplies the next denoiser's constrained input.
+            next_sigmas = torch.cat((
+                infer_timesteps_action[1:].float() / self.infer_action_scheduler.num_train_timesteps,
+                torch.zeros(1, device=self.device),
+            ))
+        for index, (step_t_action, step_delta_action) in enumerate(zip(infer_timesteps_action, infer_deltas_action)):
             if compile_action_infer:
                 torch.compiler.cudagraph_mark_step_begin()
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
@@ -1153,6 +1171,12 @@ class FastWAM(torch.nn.Module):
             pred_action = pred_action_posi
 
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            if rtc is not None:
+                # Preserve the clean frozen endpoint in FP32, without changing
+                # the dtype/shape seen by any compiled denoiser invocation.
+                if index == num_inference_steps - 1:
+                    latents_action = latents_action.float()
+                latents_action = rtc.constrain(latents_action, next_sigmas[index])
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),

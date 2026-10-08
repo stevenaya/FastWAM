@@ -69,6 +69,22 @@ def encode_state(state, processor):
     return processor.normalizer.normalizers["state"]["default"].forward(state)[:, 0]
 
 
+def encode_actions(action, state, processor):
+    """Encode an absolute RTC prior without clipping rebased action values."""
+    action = torch.as_tensor(action, dtype=torch.float32).cpu().clone()
+    unbatched = action.ndim == 2
+    if unbatched:
+        action = action.unsqueeze(0)
+    batch = {"action": {"default": action}, "state": {"default": torch.as_tensor(state).float().reshape(1, 1, -1)}}
+    for transform in processor.action_state_transforms or []:
+        batch = transform.forward(batch)
+    normalizer = processor.normalizer.normalizers["action"]["default"]
+    # Training's forward() clips to [-5, 5]; doing so here would move frozen
+    # absolute actions after rebase. This is an inverse codec, not a safety clamp.
+    result = batch["action"]["default"] * normalizer.scale + normalizer.offset
+    return result[0] if unbatched else result
+
+
 def decode_actions(action, state, processor):
     unbatched = action.ndim == 2
     if unbatched:

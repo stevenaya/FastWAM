@@ -1,13 +1,13 @@
 """Serve trained FastWAM through OpenArm's socket/SHM or direct Dora runtime."""
 
 import argparse
-import contextlib
 import json
 import logging
 import math
 import os
 from pathlib import Path
 import sys
+import time
 
 import numpy as np
 
@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "src"))
 
-from openarm_policy_runtime import AsyncChunkLogger, Backend, Prediction, Session, serve
+from openarm_policy_runtime import Backend, ModelSession, Prediction, serve
+from open_eval.rtc import ExecutionRTC
 
 
 def inspect_run(run_dir, checkpoint, text_cache_dir=None):
@@ -46,7 +47,7 @@ def inspect_run(run_dir, checkpoint, text_cache_dir=None):
 class FastWAMBackend(Backend):
     name = "fastwam"
 
-    def __init__(self, policy, *, warmup_sample=None, warmup_steps=0):
+    def __init__(self, policy, *, warmup_sample=None, warmup_steps=0, rtc=None):
         self.policy = policy
         self.camera_shapes = {
             "camera_" + meta["key"]: tuple(meta["raw_shape"][1:]) + (3,)
@@ -55,16 +56,25 @@ class FastWAMBackend(Backend):
         self.camera_fields = tuple(self.camera_shapes)
         self.horizon = int(policy.cfg.data.train.num_frames) - 1
         self.warmup_sample, self.warmup_steps = warmup_sample, warmup_steps
+        self.rtc = rtc
 
     def warmup(self):
         if not self.warmup_steps:
             return
         with np.load(self.warmup_sample, allow_pickle=False) as sample:
             observation = {name: sample[name].copy() for name in sample.files}
-        for _ in range(self.warmup_steps):
+        timings = []
+        for index in range(self.warmup_steps):
+            started = time.perf_counter_ns()
             self.policy.predict(observation)  # Discard synthetic episode output before readiness.
+            if index >= max(1, self.warmup_steps // 2):
+                timings.append(time.perf_counter_ns() - started)
+        if self.rtc is not None and timings:
+            self.rtc.delay_ns = float(np.mean(timings))
+            self.rtc.reset()
 
     def predict(self, observation):
+        started_ns = time.time_ns()
         index = observation.current_index()
         state = observation.qpos[index]
         if state.shape != (16,) or not np.isfinite(state).all():
@@ -81,21 +91,40 @@ class FastWAMBackend(Backend):
             if steps <= 0:
                 raise ValueError("denoising_steps must be positive")
             self.policy.steps = steps
-        result = self.policy.predict(model_obs)
+        execution = None
+        rtc_inputs = {}
+        if self.rtc is not None:
+            prepared = self.rtc.prepare(observation, started_ns)
+            if prepared is None:
+                if self.rtc.probe_due:
+                    probe_started = time.perf_counter_ns()
+                    self.policy.predict(model_obs)
+                    self.rtc.delay_ns = float(time.perf_counter_ns() - probe_started)
+                return Prediction(None, log_data={"rtc": {
+                    "skipped": "no_safe_window", "latency_probe": self.rtc.probe_due,
+                }})
+            prior, weights, execution = prepared
+            if prior is not None:
+                rtc_inputs = dict(action_prior=prior, action_update_weights=weights)
+        result = self.policy.predict(model_obs, **rtc_inputs)
         positions = np.asarray(result["actions"], dtype=np.float32)
         if positions.shape != (self.horizon, 16) or not np.isfinite(positions).all():
             raise ValueError(f"Expected finite absolute actions [{self.horizon},16], got {positions.shape}")
         # decode_actions already undoes z-score normalization and rebases arm joints.
         return Prediction(
             positions, interval_ns=int(1e9 / result["fps"]), cutoff_hz=15,
+            execution=execution,
             timing={"fastwam_predict_ms": result["latency_ms"]},
             log_data={"checkpoint_step": result["checkpoint_step"],
-                      "denoising_steps": self.policy.steps},
+                      "denoising_steps": self.policy.steps,
+                      "rtc": {"enabled": self.rtc is not None, "used": bool(rtc_inputs),
+                              "frozen_steps": execution["action_window_start"] if execution else 0}},
         )
 
     def reset(self, reason):
-        # No previous-action/visual history survives infer_action; immutable T5
-        # embeddings can remain cached across episodes. Session owns execution reset.
+        # Text embeddings are immutable; only executor priors belong to an episode.
+        if self.rtc is not None:
+            self.rtc.reset()
         return False
 
     def close(self):
@@ -117,7 +146,13 @@ def create_backend(args):
         seed=args.seed,
     )
     logging.info("Loaded FastWAM step %s on %s", policy.checkpoint_step, args.device)
-    return FastWAMBackend(policy, warmup_sample=args.warmup_sample, warmup_steps=args.warmup_steps)
+    rtc = ExecutionRTC(
+        int(policy.cfg.data.train.num_frames) - 1, margin_ms=args.rtc_margin_ms,
+        ramp_steps=args.rtc_ramp_steps, ramp_rate=args.rtc_ramp_rate,
+        max_lateness_ms=args.rtc_max_lateness_ms,
+    ) if args.rtc_source == "executor" else None
+    return FastWAMBackend(policy, warmup_sample=args.warmup_sample,
+                          warmup_steps=args.warmup_steps, rtc=rtc)
 
 
 def parse_args(argv=None):
@@ -131,28 +166,27 @@ def parse_args(argv=None):
     parser.add_argument("--socket-path", default="/dev/shm/fastwam-policy.socket")
     parser.add_argument("--local-server", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--prompt", default="")
-    parser.add_argument("--infer-hz", type=float, default=10.0)
     parser.add_argument("--denoising-steps", type=int, default=10)
-    parser.add_argument("--action-window-start", type=int, default=0)
-    parser.add_argument("--action-window-size", type=int)
-    parser.add_argument("--arrow-memory-map", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--torch-num-threads", type=int, default=4)
     parser.add_argument("--compile-action-infer", action="store_true")
     parser.add_argument("--seed", type=int)
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--warmup-sample", type=Path, help="Recorded RGB/state/prompt NPZ, never executed")
-    parser.add_argument("--chunk-log-path", type=Path)
-    parser.add_argument("--chunk-log-queue-size", type=int, default=0)
+    parser.add_argument("--rtc-source", choices=("none", "executor"), default="none")
+    parser.add_argument("--rtc-margin-ms", type=float, default=10)
+    parser.add_argument("--rtc-ramp-steps", type=int, default=6)
+    parser.add_argument("--rtc-ramp-rate", type=float, default=5)
+    parser.add_argument("--rtc-max-lateness-ms", type=float, default=50)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
-    if not math.isfinite(args.infer_hz) or args.infer_hz <= 0:
-        parser.error("infer-hz must be positive and finite")
     if args.denoising_steps <= 0 or args.torch_num_threads <= 0:
         parser.error("denoising-steps and torch-num-threads must be positive")
-    if args.action_window_start < 0 or (args.action_window_size is not None and args.action_window_size <= 0):
-        parser.error("action window must have nonnegative start and positive size")
     if args.warmup_steps < 0 or (args.warmup_steps and args.warmup_sample is None):
         parser.error("positive warmup-steps requires --warmup-sample")
+    if args.rtc_ramp_steps < 0 or any(not math.isfinite(value) or value < 0 for value in (
+        args.rtc_margin_ms, args.rtc_ramp_rate, args.rtc_max_lateness_ms,
+    )):
+        parser.error("RTC margin, ramp and lateness must be finite and nonnegative")
     return args
 
 
@@ -164,28 +198,16 @@ def main(argv=None):
     if args.dry_run:
         print(json.dumps({**contract, "transport": args.transport, "device": args.device}, indent=2))
         return
-    with contextlib.ExitStack() as stack:
-        chunk_log = None
-        if args.chunk_log_path:
-            chunk_log = stack.enter_context(contextlib.closing(
-                AsyncChunkLogger(args.chunk_log_path, max_queue=args.chunk_log_queue_size)))
-        session_options = dict(
-            prompt=args.prompt, infer_hz=args.infer_hz,
-            action_window_start=args.action_window_start,
-            action_window_size=args.action_window_size, chunk_log=chunk_log,
-        )
-        if args.transport == "dora":
-            from openarm_policy_runtime.dora_runner import serve_dora
-            serve_dora(lambda: create_backend(args), **session_options)
-        else:
-            backend = create_backend(args)
-            try:
-                backend.warmup()
-                serve(args.socket_path, lambda: Session(
-                    backend, arrow_memory_map=args.arrow_memory_map, **session_options,
-                ), listen=args.local_server)
-            finally:
-                backend.close()
+    if args.transport == "dora":
+        from dora_openarm_local_policy_server.dora_runner import serve_dora
+        serve_dora(lambda: create_backend(args), prompt=args.prompt)
+    else:
+        backend = create_backend(args)
+        try:
+            backend.warmup()
+            serve(args.socket_path, lambda: ModelSession(backend), listen=args.local_server)
+        finally:
+            backend.close()
 
 
 if __name__ == "__main__":

@@ -12,7 +12,6 @@ import tempfile
 import time
 
 import numpy as np
-import pyarrow as pa
 
 
 def main():
@@ -23,8 +22,9 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--model-base-path", type=Path, required=True)
     parser.add_argument("--text-cache-dir", type=Path, required=True)
+    parser.add_argument("--rtc", action="store_true", help="Also verify a simulated executor handoff")
     args = parser.parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    args.output_dir.mkdir(parents=True, exist_ok=False)
     root = Path(__file__).resolve().parents[1]
     with np.load(args.sample, allow_pickle=False) as sample:
         fields = {"position": sample["state"].astype(np.float32)[None]}
@@ -37,13 +37,6 @@ def main():
             metadata.update({name + ".height": value.shape[1], name + ".width": value.shape[2]})
     with tempfile.TemporaryDirectory(prefix="fastwam-socket-") as temp:
         temp = Path(temp)
-        arrow = temp / "obs.arrow"
-        arrays = [pa.array([array.reshape(-1).tolist()],
-                          type=pa.list_(pa.float32() if name == "position" else pa.uint8()))
-                  for name, array in fields.items()]
-        batch = pa.record_batch(arrays + [pa.array([prompt])], names=list(fields) + ["task_prompt"])
-        with pa.OSFile(str(arrow), "wb") as sink, pa.ipc.new_file(sink, batch.schema) as writer:
-            writer.write_batch(batch)
         payload, descriptors = bytearray(), {}
         for name, array in fields.items():
             descriptors[name] = {"offset": len(payload), "nbytes": array.nbytes,
@@ -58,10 +51,10 @@ def main():
         command = [sys.executable, str(root / "open_eval/policy_server.py"),
                    "--run-dir", str(args.run_dir), "--checkpoint", str(args.checkpoint),
                    "--model-base-path", str(args.model_base_path), "--text-cache-dir", str(args.text_cache_dir),
-                   "--socket-path", address, "--local-server", "--seed", "42", "--infer-hz", "1000",
-                   "--action-window-start", "3", "--action-window-size", "8",
-                   "--warmup-steps", "2", "--warmup-sample", str(args.sample),
-                   "--chunk-log-path", str(args.output_dir / "chunks.jsonl")]
+                   "--socket-path", address, "--local-server", "--seed", "42",
+                   "--warmup-steps", "4", "--warmup-sample", str(args.sample)]
+        if args.rtc:
+            command += ["--rtc-source", "executor"]
         with (args.output_dir / "server.log").open("w") as log:
             process = subprocess.Popen(command, cwd=root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             try:
@@ -85,29 +78,49 @@ def main():
                             return response
 
                         assert request({"ping": True})["ready"]
-                        arrow_response = request({"data_path": str(arrow), "metadata": metadata, "reset": True})
-                        ring_response = request({"transport": "shm_ring_v1", "shm": descriptor,
-                                                 "metadata": metadata, "reset": True})
-                        shifted = request({"transport": "shm_ring_v1", "shm": {**descriptor, "sequence": 2},
-                                           "metadata": metadata})
-                        changed_steps = request({"data_path": str(arrow),
-                                                 "metadata": {**metadata, "denoising_steps": 4}})
-                        assert ring_response["input_sequence"] == 1
-                        assert arrow_response["metadata"]["reset"] and ring_response["metadata"]["reset"]
-                        assert not shifted["metadata"]["reset"] and shifted["metadata"]["action_window_start"] == 3
-                        values = np.asarray(ring_response["positions"])
-                        assert values.shape == (8, 16) and np.isfinite(values).all()
-                        difference = float(np.max(np.abs(values - np.asarray(arrow_response["positions"]))))
-                        assert difference < 1e-5, difference
+                        responses = []
+                        def infer(sequence, **overrides):
+                            result = request({"transport": "shm_ring_v1",
+                                              "shm": {**descriptor, "sequence": sequence},
+                                              "metadata": {**metadata, "timestamp": time.time_ns()},
+                                              "chunk_id": str(sequence), **overrides})
+                            assert result["input_sequence"] == sequence
+                            assert sequence in result["released_input_sequences"]
+                            values = np.asarray(result["positions"])
+                            assert values.shape == (32, 16) and np.isfinite(values).all()
+                            responses.append(result)
+                            return result
+
+                        first = infer(1, reset_reason="request", restart_execution=True)
+                        repeat = infer(2, reset_reason="request", restart_execution=True)
+                        assert first["reset_applied"] and repeat["reset_applied"]
+                        difference = float(np.max(np.abs(np.asarray(first["positions"]) - repeat["positions"])))
+                        rtc_error = None
+                        if args.rtc:
+                            origin = time.time_ns()
+                            plan = dict(chunk_id="adopted-2", sample_chunk_id="2",
+                                        start_timestamp_ns=origin, interval_ns=repeat["interval"],
+                                        positions=repeat["positions"],
+                                        inference_started_timestamp_ns=repeat["execution"]["inference_started_timestamp_ns"],
+                                        received_timestamp_ns=origin)
+                            timed = infer(3, execution_plan=plan, metadata={**metadata, "timestamp": origin})
+                            execution = timed["execution"]
+                            frozen = execution["action_window_start"]
+                            assert 0 < frozen < 32 and execution["based_on_chunk_id"] == "adopted-2"
+                            # Same origin and action interval: the frozen prefix must decode back to the plan.
+                            rtc_error = float(np.max(np.abs(np.asarray(timed["positions"])[:frozen] -
+                                                           np.asarray(plan["positions"])[:frozen])))
+                            assert rtc_error < 1e-5, rtc_error
+                        reset = infer(4, reset_reason="trial", restart_execution=True)
+                        if args.rtc:
+                            assert reset["execution"]["based_on_chunk_id"] == ""
                         report = {"checkpoint": str(args.checkpoint), "cuda_visible_devices": os.getenv("CUDA_VISIBLE_DEVICES"),
-                                  "action_shape": list(values.shape), "arrow_shm_max_abs_diff": difference,
-                                  "arrow_policy_ms": arrow_response["timing"]["policy_ms"],
-                                  "shm_policy_ms": ring_response["timing"]["policy_ms"],
-                                  "four_step_policy_ms": changed_steps["timing"]["policy_ms"],
-                                  "ping": True, "shm_ack": True, "reset_and_window": True,
+                                  "action_shape": [32, 16], "repeat_max_abs_diff": difference,
+                                  "policy_ms": [r["timing"]["policy_ms"] for r in responses],
+                                  "rtc": args.rtc, "rtc_frozen_max_abs_diff": rtc_error,
+                                  "ping": True, "shm_release": True, "reset": True,
                                   "robot_connected": False}
-                        (args.output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-                        print(json.dumps(report, indent=2), flush=True)
+                        (args.output_dir / "responses.json").write_text(json.dumps(responses) + "\n")
             finally:
                 if process.poll() is None:
                     os.killpg(process.pid, signal.SIGINT)
@@ -116,6 +129,11 @@ def main():
                     except subprocess.TimeoutExpired:
                         os.killpg(process.pid, signal.SIGKILL)
                         process.wait()
+            if process.returncode not in (0, -signal.SIGINT):
+                raise RuntimeError(f"Server shutdown failed with exit code {process.returncode}")
+            report.update(passed=True, server_exit_code=process.returncode)
+            (args.output_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+            print(json.dumps(report, indent=2), flush=True)
 
 
 if __name__ == "__main__":

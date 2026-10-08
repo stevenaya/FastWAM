@@ -149,10 +149,16 @@ state normalization, finite tensors, action shapes and unclipped action roundtri
 `open_eval/policy_server.py` reuses `scripts.serve_openarm.OpenArmPolicy`, including
 the training camera transforms, cached T5 prompt format, state normalization and
 absolute action decoding. No HTTP hop is used in the evaluation workspace.
-The backend returns the full `[32,16]` action sequence; the shared runtime owns
-socket/Arrow/`shm_ring_v1` inputs, ACKs, reset markers, action windows and logs.
-The first chunk after an execution reset starts at zero; subsequent chunks use
-the configured window start. Immutable text embeddings are retained on reset.
+The backend returns the full `[32,16]` action sequence through `ModelSession`.
+The evaluation caller owns pacing, windows, reset boundaries, chunk IDs and logs.
+Socket inputs use `shm_ring_v1` only; direct Dora uses Arrow through the same caller
+session. The old `Session`/Arrow-file socket API is not supported. Immutable text
+embeddings are retained on reset; executor plans are cleared.
+
+Runtime contract: `reazon-research/openarm-eval-workspace` commit
+`e6b2801` and its pinned node/model submodules. Use that set together, not arbitrary
+node branch tips. This wrapper follows the same model-only boundary as its
+GR00T and OpenPI entrypoints.
 
 From the evaluation workspace, use `demo_gr00t/fastwam_pillow_100k.yaml` with
 `launch_inference.sh --dry-run` first. The example uses the existing model
@@ -171,7 +177,7 @@ python open_eval/policy_server.py \
   --model-base-path /path/to/base-model-cache \
   --text-cache-dir /path/to/text_embeds \
   --local-server --socket-path /dev/shm/fastwam-policy.socket \
-  --denoising-steps 10 --action-window-size 16
+  --denoising-steps 10
 ```
 
 Required deployment assets are the weight-only checkpoint, the run's resolved
@@ -188,31 +194,90 @@ and `+override_instruction='...'` before serving. `--compile-action-infer` opts
 into the upstream action-inference compiler; it is off in the validated baseline.
 Metadata `denoising_steps` changes the step count for subsequent calls.
 
-`--transport dora` uses the runtime's direct Dora runner. The model environment
+`--transport dora` uses `dora_openarm_local_policy_server.dora_runner`. The model environment
 must separately provide a Dora version compatible with the workspace; default
 socket mode does not import Dora. Do not merge Torch/JAX/model environments.
 Optional `--warmup-steps N --warmup-sample observation.npz` runs recorded inputs
 before publishing readiness and discards their actions. Warmup does not consume
 the first real action/reset marker. `--seed` fixes inference noise for comparisons.
 
-CPU tests (runtime package on PYTHONPATH):
+## Executor-aligned RTC
+
+Set `policy.args.rtc-source: executor` in the example YAML; use `none` for native
+ordinary inference. The dataflow must connect `actions-executor/execution_plan`
+to `policy-server/execution_plan`. It already does so at the pinned eval revision.
+Feedback describes the adopted pre-filter command plan, not measured motor motion.
+The caller handles the single pending handoff and stale attempt rejection.
+
+At observation time `t0`, inference start `ts`, action interval `dt`, measured
+latency `D` and margin `M`, freeze `F = ceil((max(0, ts-t0) + D + M)/dt)` steps.
+Warmup initializes latency; executor receipt feedback updates an EWMA once per
+sample. If `F >= H`, return a prefill/skip instead of an unusable timed chunk.
+For fresh observations, a discarded inference probe at most once every five
+seconds can replace a stale oversized latency estimate; it never emits actions.
+Align the absolute plan to `t0 + i*dt`; a just-preceding observation can use one
+retained previous plan. Completed plans hold their last target, as in the executor.
+The backend returns timing and `based_on_chunk_id` in `Prediction.execution`.
+Bootstrap starts at zero; subsequent caller windows begin at `F`.
+
+The absolute prior is rebased to the current raw state through training's relative
+arm transform; grippers stay absolute. Apply the checkpoint's affine action
+normalization without its training-only `[-5,5]` clip: clipping a rebased prior
+would change frozen absolute targets. Normal training/state processing is unchanged.
+This inverse codec is not a robot safety clamp; actuator limits remain separate.
+
+In the original FastWAM action sampler, sigma decreases from one to zero and
+velocity is `noise - clean_action`. With the same initial Gaussian noise `eps`:
+
+```text
+anchor_next = (1 - sigma_next) * normalized_prior + sigma_next * eps
+proposal = native_scheduler.step(velocity, native_delta, latent)
+latent_next = (1 - update_weight) * anchor_next + update_weight * proposal
+```
+
+Every denoising step applies the constraint, not just the final decoded result.
+Weights are zero in the frozen prefix, start at zero at takeover and ramp to the
+free region's weight one. `rtc-ramp-rate: 0` is linear; positive rates use a
+normalized exponential. Frozen endpoints are retained in FP32. This is inference
+time inpainting, not training-time RTC or proof of the paper's guided-RTC quality.
+The current adapter supports the original FastWAM only, not overridden Joint/IDM
+samplers. Ordinary no-prior sampling and its RNG sequence are unchanged.
+
+`rtc-margin-ms`, `rtc-ramp-steps`, `rtc-ramp-rate`, `rtc-max-lateness-ms` configure
+the model algorithm. `infer-hz`, `action-window-start/size`, reset-gap and chunk
+logging remain caller settings in the YAML, not server CLI arguments. Resets and
+disconnect discard the model's plan cache; clock alignment assumes a shared host.
+
+## Validation
+
+CPU tests (runtime and local policy node source directories on PYTHONPATH):
 
 ```bash
-CUDA_VISIBLE_DEVICES= python -m unittest scripts.test_openarm_runtime -v
+CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
+  python -m unittest scripts.test_openarm_runtime scripts.test_openarm_rtc_model -v
 ```
 
 `scripts/check_openarm_runtime.py` launches a temporary socket server, uses a
-recorded NPZ observation, checks Arrow/SHM equivalence, runtime step changes and
-reset/window behavior, then stops the server. Run it only on a free GPU; it never
+recorded NPZ observation, checks full SHM predictions, input release and reset,
+then stops the server. Add `--rtc` to simulate executor feedback and check the
+decoded frozen prefix against its absolute prior. Use a new output directory and
+an explicitly assigned free GPU; it never
 launches Dora or a robot driver. Its outputs contain local observation/action
 records and should not be committed. `artifacts/` is ignored for this reason.
 
-2026-10-02 smoke: step 100k loaded strictly on A100 80GB GPU 0; Arrow/SHM max action
+Historical 2026-10-02 smoke, before the ModelSession migration: step 100k loaded
+strictly on A100 80GB GPU 0; Arrow/SHM max action
 difference was 0 with seed 42. After two warmups, 10-step policy calls took
 approximately 508-519 ms and one 4-step call 246 ms. These are a few smoke samples,
 not p95/throughput or task-success benchmarks. Playback is 30 Hz; `infer-hz=10`
 is only a rate cap and does not make inference run at 10 Hz. Full robot evaluation
 and direct Dora execution with this backend remain untested.
+
+2026-10-09 migration: 22 CPU tests pass (10 protocol/timeline, 12 sampler/codec),
+including rebase outside the clipping range, absolute grippers, frozen/ramp/free
+regions, nonlinear schedules and unchanged ordinary sampling/RNG. The compiled
+interface test uses a mock, not GPU compilation. All eight local GPUs were busy;
+no GPU checkpoint, RTC latency or physical-robot validation was run for this revision.
 
 Training scripts now locate the repo relatively. Set `OPENARM_DATA_ROOT`,
 `DIFFSYNTH_MODEL_BASE_PATH`, `UV_PROJECT_ENVIRONMENT` and `OUTPUT_DIR` as needed;
