@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+export PATH="/workspace/FastWAM/.venv/bin:$PATH"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export CPU_SET="${CPU_SET:-0-31}"
+export TOKENIZERS_PARALLELISM=false
+export HF_HOME=/workspace/FastWAM/.cache/huggingface
+export DIFFSYNTH_MODEL_BASE_PATH=/mnt/syno127/volume1/stevenaya/fast_wam/checkpoints
+export DIFFSYNTH_SKIP_DOWNLOAD=true
+export OPENARM_DATA_ROOT="${OPENARM_DATA_ROOT:-/workspace/FastWAM/data/pillow_0702}"
+export PYTHONUNBUFFERED=1

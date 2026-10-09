@@ -1,0 +1,72 @@
+train:
+  _target_: fastwam.openarm.OpenArmDataset
+  dataset_dirs: ["${oc.env:OPENARM_DATA_ROOT,/workspace/FastWAM/data/pillow_0702}"]
+  shape_meta:
+    images:
+      - {key: head_left, raw_shape: [3, 720, 1280], shape: [3, 240, 320]}
+      - {key: wrist_left, raw_shape: [3, 600, 960], shape: [3, 240, 320]}
+      - {key: wrist_right, raw_shape: [3, 600, 960], shape: [3, 240, 320]}
+    action: [{key: default, raw_shape: 16, shape: 16}]
+    state: [{key: default, raw_shape: 16, shape: 16}]
+  num_frames: 33
+  global_sample_stride: 1
+  action_video_freq_ratio: 4
+  video_size: [384, 320]
+  val_set_proportion: 0.05
+  is_training_set: true
+  pretrained_norm_stats: ${data.train.dataset_dirs.0}/dataset_stats.json
+  skip_padding_as_possible: false
+  concat_multi_camera: robotwin
+  video_backend: torchcodec
+  tolerance_s: 0.04
+  processor:
+    _target_: fastwam.datasets.lerobot.processors.fastwam_processor.FastWAMProcessor
+    _convert_: all
+    shape_meta: ${data.train.shape_meta}
+    num_obs_steps: 33
+    num_image_steps: 9
+    num_output_cameras: 3
+    action_output_dim: 16
+    proprio_output_dim: 16
+    action_state_transforms:
+      - _target_: fastwam.openarm.RelativeArmJoints
+        indices: [0, 1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+    use_stepwise_action_norm: false
+    norm_default_mode: z-score
+    norm_exception_mode: null
+    action_state_merger:
+      _target_: fastwam.datasets.lerobot.transforms.action_state_merger.ConcatLeftAlign
+    train_transforms:
+      head_left:
+        - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+        - _target_: fastwam.openarm.CropResize
+          crop_xyxy: [23, 0, 1257, 720]
+      wrist_left:
+        - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+        - _target_: fastwam.openarm.CropResize
+          crop_xyxy: [51, 0, 909, 600]
+      wrist_right:
+        - _target_: fastwam.datasets.lerobot.transforms.image.ToTensor
+        - _target_: fastwam.openarm.CropResize
+          crop_xyxy: [51, 0, 909, 600]
+    val_transforms: ${data.train.processor.train_transforms}
+  text_embedding_cache_dir: ${data.train.dataset_dirs.0}/text_embeds
+  context_len: 128
+
+val:
+  _target_: fastwam.openarm.OpenArmDataset
+  dataset_dirs: ${data.train.dataset_dirs}
+  shape_meta: ${data.train.shape_meta}
+  num_frames: ${data.train.num_frames}
+  global_sample_stride: 1
+  action_video_freq_ratio: 4
+  video_size: ${data.train.video_size}
+  val_set_proportion: ${data.train.val_set_proportion}
+  is_training_set: false
+  pretrained_norm_stats: ${data.train.pretrained_norm_stats}
+  concat_multi_camera: robotwin
+  video_backend: torchcodec
+  tolerance_s: 0.04
+  processor: ${data.train.processor}
+  text_embedding_cache_dir: ${data.train.text_embedding_cache_dir}
+  context_len: 128
