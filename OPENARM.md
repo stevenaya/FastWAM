@@ -164,7 +164,7 @@ Runtime contract: `reazon-research/openarm-eval-workspace` commit
 node branch tips. This wrapper follows the same model-only boundary as its
 GR00T and OpenPI entrypoints.
 
-From the evaluation workspace, use `demo_gr00t/fastwam_pillow_100k.yaml` with
+From the evaluation workspace, use `exp/FastWAM/fastwam_pillow_100k.yaml` with
 `launch_inference.sh --dry-run` first. The example now uses this submodule's `.venv`
 and `deployment_assets/`, provisioned by the uv deployment guide. `UV_NO_SYNC=1`
 prevents launch-time changes to that environment. Large linked weights still need

@@ -162,7 +162,7 @@ on the actual inference GPU. A CUDA-version check alone does not prove 5090 read
 
 ## 4. Start an Evaluation Experiment
 
-The included `demo_gr00t/fastwam_pillow_100k.yaml` resolves environment/assets from
+The included `exp/FastWAM/fastwam_pillow_100k.yaml` resolves environment/assets from
 `${script_dir}/models/FastWAM`, not an old sibling training checkout. Review output
 directory, socket, GPU, prompt and camera wiring. It is an **experimental RTC**
 example: set `rtc-source: none` for ordinary inference first. RTC requires executor
@@ -171,9 +171,9 @@ feedback and does not guarantee task success or safety. Current model output is
 
 ```bash
 cd ../..
-./launch_inference.sh --dry-run demo_gr00t/fastwam_pillow_100k.yaml
+./launch_inference.sh --dry-run exp/FastWAM/fastwam_pillow_100k.yaml
 # Only after offline validation and explicit hardware authorization:
-./launch_inference.sh demo_gr00t/fastwam_pillow_100k.yaml
+./launch_inference.sh exp/FastWAM/fastwam_pillow_100k.yaml
 ```
 
 Keep the model `.venv` active for the launcher's Python/PyYAML and uv commands.
