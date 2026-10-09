@@ -1,6 +1,8 @@
 
 # Misc
 artifacts/
+deployment_assets/
+deployment/.venv/
 outputs/
 checkpoints
 data/*

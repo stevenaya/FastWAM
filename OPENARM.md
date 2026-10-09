@@ -1,5 +1,9 @@
 # Fast-WAM on OpenArm Pillow
 
+For a fresh inference machine, follow [the uv deployment guide](deployment/README.md).
+It builds this checkout's `.venv` and prepares `deployment_assets/`; it does not
+require the legacy `/workspace/FastWAM` training checkout.
+
 Fork: https://github.com/stevenaya/FastWAM, branch `openarm-pillow-runtime`.
 The 100k run completed with exit code 0 on 2026-09-13. The original training
 checkout and weights remain unchanged; this fork includes its source changes
@@ -161,10 +165,10 @@ node branch tips. This wrapper follows the same model-only boundary as its
 GR00T and OpenPI entrypoints.
 
 From the evaluation workspace, use `demo_gr00t/fastwam_pillow_100k.yaml` with
-`launch_inference.sh --dry-run` first. The example uses the existing model
-environment with `UV_NO_SYNC=1`; change checkpoint, model cache, environment,
-text-cache and recording paths for your machine. `PYTHONPATH` selects this fork's
-`src`, even when reusing the training environment's editable install.
+`launch_inference.sh --dry-run` first. The example now uses this submodule's `.venv`
+and `deployment_assets/`, provisioned by the uv deployment guide. `UV_NO_SYNC=1`
+prevents launch-time changes to that environment. Large linked weights still need
+the declared shared-storage mount or materialization when transferring machines.
 
 Standalone invocation (set these paths for the target machine):
 
