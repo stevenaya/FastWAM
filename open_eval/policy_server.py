@@ -47,7 +47,8 @@ def inspect_run(run_dir, checkpoint, text_cache_dir=None):
 class FastWAMBackend(Backend):
     name = "fastwam"
 
-    def __init__(self, policy, *, warmup_sample=None, warmup_steps=0, rtc=None):
+    def __init__(self, policy, *, warmup_sample=None, warmup_steps=0, rtc=None,
+                 time_align_actions=False):
         self.policy = policy
         self.camera_shapes = {
             "camera_" + meta["key"]: tuple(meta["raw_shape"][1:]) + (3,)
@@ -57,6 +58,7 @@ class FastWAMBackend(Backend):
         self.horizon = int(policy.cfg.data.train.num_frames) - 1
         self.warmup_sample, self.warmup_steps = warmup_sample, warmup_steps
         self.rtc = rtc
+        self.time_align_actions = time_align_actions
 
     def warmup(self):
         if not self.warmup_steps:
@@ -64,11 +66,18 @@ class FastWAMBackend(Backend):
         with np.load(self.warmup_sample, allow_pickle=False) as sample:
             observation = {name: sample[name].copy() for name in sample.files}
         timings = []
+        rtc_inputs = {}
         for index in range(self.warmup_steps):
             started = time.perf_counter_ns()
-            self.policy.predict(observation)  # Discard synthetic episode output before readiness.
+            result = self.policy.predict(observation, **rtc_inputs)
             if index >= max(1, self.warmup_steps // 2):
                 timings.append(time.perf_counter_ns() - started)
+            if self.rtc is not None and index == 0:
+                # Warm the constrained sampler too; none of these actions are published.
+                rtc_inputs = dict(
+                    action_prior=np.asarray(result["actions"], dtype=np.float32),
+                    action_update_weights=np.linspace(0, 1, self.horizon, dtype=np.float32),
+                )
         if self.rtc is not None and timings:
             self.rtc.delay_ns = float(np.mean(timings))
             self.rtc.reset()
@@ -106,6 +115,9 @@ class FastWAMBackend(Backend):
             prior, weights, execution = prepared
             if prior is not None:
                 rtc_inputs = dict(action_prior=prior, action_update_weights=weights)
+        elif self.time_align_actions and not observation.metadata.get("execution_restart"):
+            # Only label the full prediction; the caller crops and executor resamples it.
+            execution = {"action_origin_timestamp_ns": int(observation.timestamp)}
         result = self.policy.predict(model_obs, **rtc_inputs)
         positions = np.asarray(result["actions"], dtype=np.float32)
         if positions.shape != (self.horizon, 16) or not np.isfinite(positions).all():
@@ -118,7 +130,7 @@ class FastWAMBackend(Backend):
             log_data={"checkpoint_step": result["checkpoint_step"],
                       "denoising_steps": self.policy.steps,
                       "rtc": {"enabled": self.rtc is not None, "used": bool(rtc_inputs),
-                              "frozen_steps": execution["action_window_start"] if execution else 0}},
+                              "frozen_steps": execution.get("action_window_start", 0) if execution else 0}},
         )
 
     def reset(self, reason):
@@ -152,7 +164,8 @@ def create_backend(args):
         max_lateness_ms=args.rtc_max_lateness_ms,
     ) if args.rtc_source == "executor" else None
     return FastWAMBackend(policy, warmup_sample=args.warmup_sample,
-                          warmup_steps=args.warmup_steps, rtc=rtc)
+                          warmup_steps=args.warmup_steps, rtc=rtc,
+                          time_align_actions=args.time_align_actions)
 
 
 def parse_args(argv=None):
@@ -173,6 +186,8 @@ def parse_args(argv=None):
     parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--warmup-sample", type=Path, help="Recorded RGB/state/prompt NPZ, never executed")
     parser.add_argument("--rtc-source", choices=("none", "executor"), default="none")
+    parser.add_argument("--time-align-actions", action="store_true",
+                        help="Non-RTC: timestamp actions from the observation, except the first execution window")
     parser.add_argument("--rtc-margin-ms", type=float, default=10)
     parser.add_argument("--rtc-ramp-steps", type=int, default=6)
     parser.add_argument("--rtc-ramp-rate", type=float, default=5)

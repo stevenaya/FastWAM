@@ -108,6 +108,30 @@ class BackendTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.backend.predict(self.obs)
 
+    def test_non_rtc_time_alignment_preserves_first_window_and_no_ack_wait(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                self.backend.time_align_actions = enabled
+                caller = Session(action_window_size=16, timing_log_every=0)
+                self.addCleanup(caller.close)
+                for generation in (1, 1, 2):
+                    request = caller.prepare(generation, self.obs.metadata, self.obs.prompt)
+                    full = self.session.handle_observation(self.obs, control=request)
+                    expected = (
+                        {"action_origin_timestamp_ns": self.obs.timestamp}
+                        if enabled and not request["restart_execution"] else None
+                    )
+                    self.assertEqual(full["execution"], expected)
+                    response = caller.complete(request, full)
+                    self.assertEqual(response["metadata"].get("action_origin_timestamp_ns"),
+                                     self.obs.timestamp if expected else None)
+                    self.assertNotIn("based_on_chunk_id", response["metadata"])
+                    self.assertNotIn("max_lateness_ns", response["metadata"])
+                    np.testing.assert_array_equal(response["positions"], full["positions"][:16])
+                    self.assertEqual(self.policy.priors[-1], {})
+                    caller.sent(response)
+                    self.assertFalse(caller.requires_plan(generation, None))
+
     def test_shm_matches_direct_observation_and_releases_slot(self):
         expected = self.backend.predict(self.obs).positions
         with tempfile.TemporaryDirectory() as temp:
@@ -135,6 +159,7 @@ class BackendTest(unittest.TestCase):
             np.testing.assert_array_equal(result["positions"], expected)
 
     def test_rtc_bootstrap_freeze_and_zero_start_ramp(self):
+        self.backend.time_align_actions = True  # RTC keeps its own timing contract.
         rtc = self.backend.rtc = ExecutionRTC(32, margin_ms=0, ramp_steps=3, ramp_rate=0)
         with patch("open_eval.policy_server.time.time_ns", return_value=self.obs.timestamp):
             first = self.backend.predict(self.obs)
@@ -203,8 +228,16 @@ class BackendTest(unittest.TestCase):
         self.assertGreater(rtc.delay_ns, 0)
         self.assertIsNone(rtc.plan)
         self.assertEqual(len(self.policy.observations), 2)
+        self.assertEqual(self.policy.priors[0], {})
+        self.assertEqual(self.policy.priors[1]["action_prior"].shape, (32, 16))
+        np.testing.assert_array_equal(
+            self.policy.priors[1]["action_update_weights"], np.linspace(0, 1, 32, dtype=np.float32)
+        )
 
     def test_cli_rejects_invalid_options_and_old_session_flags(self):
+        required = ["--run-dir", "/tmp/run", "--checkpoint", "/tmp/step.pt"]
+        self.assertFalse(parse_args(required).time_align_actions)
+        self.assertTrue(parse_args([*required, "--time-align-actions"]).time_align_actions)
         for extra in (["--denoising-steps", "0"], ["--warmup-steps", "1"],
                       ["--rtc-ramp-steps", "-1"], ["--rtc-margin-ms", "nan"],
                       ["--action-window-size", "0"], ["--arrow-memory-map"]):
